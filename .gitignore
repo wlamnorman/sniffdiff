@@ -1,2 +1,11 @@
 /target
 /docs/private/
+
+# Cargo/rustfmt generated files
+debug
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Editors
+.idea/

@@ -1,0 +1,64 @@
+name: SniffDiff
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - "**.py"
+      - ".github/workflows/sniff.yml"
+
+permissions:
+  contents: read
+
+env:
+  SNIFFDIFF_LIMIT: "20"
+  SNIFFDIFF_CALLER_PREVIEW_LIMIT: "5"
+
+concurrency:
+  group: sniffdiff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sniff:
+    name: Sniff PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sniffdiff
+        run: cargo install sniffdiff --locked
+
+      - name: Run sniffdiff on this PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          sniffdiff "$BASE_SHA..$HEAD_SHA" \
+            --limit "$SNIFFDIFF_LIMIT" \
+            --caller-preview-limit "$SNIFFDIFF_CALLER_PREVIEW_LIMIT" \
+            > sniffdiff-report.txt
+          status=$?
+          cat sniffdiff-report.txt
+
+          {
+            echo "## sniffdiff report"
+            echo
+            echo '```text'
+            cat sniffdiff-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$status"

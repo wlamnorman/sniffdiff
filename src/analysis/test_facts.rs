@@ -133,7 +133,7 @@ mod tests {
             after: Some(symbol),
             symbol_facts: SymbolFacts {
                 kind: SymbolKind::Function,
-                visibility: SymbolVisibility::Publicish,
+                visibility: SymbolVisibility::Public,
             },
             signature_change: None,
             complexity_delta: None,

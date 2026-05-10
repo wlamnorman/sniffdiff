@@ -1,11 +1,18 @@
 /target
 /docs/private/
+/dist/
+/wheelhouse/
 
 # Cargo/rustfmt generated files
 debug
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
+
+# Python packaging
+*.egg-info/
+__pycache__/
+.venv/
 
 # Editors
 .idea/

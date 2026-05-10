@@ -23,6 +23,7 @@ use crate::analysis::signals::attach_review_signals;
 use crate::analysis::test_facts::derive_test_facts;
 use crate::git::GitBackend;
 use crate::language::{LanguageAdapter, Reference, Symbol};
+use crate::timing::TimingRecorder;
 
 pub(crate) fn analyze(
     git: &impl GitBackend,
@@ -31,40 +32,92 @@ pub(crate) fn analyze(
     head: &str,
     options: AnalysisOptions,
 ) -> Result<Analysis> {
-    let changed_files = git.changed_files(base, head)?;
-    let (before, references_before) = parse_snapshot_with_references(git, adapter, base)?;
-    let (after, references_after) = parse_snapshot_with_references(git, adapter, head)?;
-    let (tests_after, test_references_after) =
-        parse_test_snapshot_with_references(git, adapter, head)?;
-    validate_parse_errors(&[&before, &after, &tests_after], options)?;
+    analyze_inner(git, adapter, base, head, options, None)
+}
+
+pub(crate) fn analyze_recorded(
+    git: &impl GitBackend,
+    adapter: &impl LanguageAdapter,
+    base: &str,
+    head: &str,
+    options: AnalysisOptions,
+    timings: &mut TimingRecorder,
+) -> Result<Analysis> {
+    analyze_inner(git, adapter, base, head, options, Some(timings))
+}
+
+fn analyze_inner(
+    git: &impl GitBackend,
+    adapter: &impl LanguageAdapter,
+    base: &str,
+    head: &str,
+    options: AnalysisOptions,
+    mut timings: Option<&mut TimingRecorder>,
+) -> Result<Analysis> {
+    let changed_files = time(&mut timings, "git_changed_files", || {
+        git.changed_files(base, head)
+    })?;
+    let (before, references_before) = time(&mut timings, "before_snapshot", || {
+        parse_snapshot_with_references(git, adapter, base)
+    })?;
+    let (after, references_after) = time(&mut timings, "after_snapshot", || {
+        parse_snapshot_with_references(git, adapter, head)
+    })?;
+    let (tests_after, test_references_after) = time(&mut timings, "test_snapshot", || {
+        parse_test_snapshot_with_references(git, adapter, head)
+    })?;
+    time(&mut timings, "parse_error_validation", || {
+        validate_parse_errors(&[&before, &after, &tests_after], options)
+    })?;
     let before_module_index = ModuleIndex::from_symbols(&before.symbols);
     let after_module_index = ModuleIndex::from_symbols(&after.symbols);
-    let mut symbol_changes = diff_symbols(&before.symbols, &after.symbols, &changed_files);
-    attach_reference_facts(
-        &mut symbol_changes,
-        ReferenceSnapshot {
-            references: &references_before,
-            module_index: &before_module_index,
-            symbols: &before.symbols,
-        },
-        ReferenceSnapshot {
-            references: &references_after,
-            module_index: &after_module_index,
-            symbols: &after.symbols,
-        },
-        &changed_files,
-    );
-    attach_test_reference_facts(
-        &mut symbol_changes,
-        ReferenceSnapshot {
-            references: &test_references_after,
-            module_index: &after_module_index,
-            symbols: &tests_after.symbols,
-        },
-        &changed_files,
-    );
-    let test_facts = derive_test_facts(&changed_files, &symbol_changes, &tests_after);
-    attach_review_signals(&mut symbol_changes, &test_facts);
+    let mut symbol_changes = time(&mut timings, "symbol_diff", || {
+        Ok(diff_symbols(
+            &before.symbols,
+            &after.symbols,
+            &changed_files,
+        ))
+    })?;
+    time(&mut timings, "reference_facts", || {
+        attach_reference_facts(
+            &mut symbol_changes,
+            ReferenceSnapshot {
+                references: &references_before,
+                module_index: &before_module_index,
+                symbols: &before.symbols,
+            },
+            ReferenceSnapshot {
+                references: &references_after,
+                module_index: &after_module_index,
+                symbols: &after.symbols,
+            },
+            &changed_files,
+        );
+        Ok(())
+    })?;
+    time(&mut timings, "test_reference_facts", || {
+        attach_test_reference_facts(
+            &mut symbol_changes,
+            ReferenceSnapshot {
+                references: &test_references_after,
+                module_index: &after_module_index,
+                symbols: &tests_after.symbols,
+            },
+            &changed_files,
+        );
+        Ok(())
+    })?;
+    let test_facts = time(&mut timings, "test_facts", || {
+        Ok(derive_test_facts(
+            &changed_files,
+            &symbol_changes,
+            &tests_after,
+        ))
+    })?;
+    time(&mut timings, "review_signals", || {
+        attach_review_signals(&mut symbol_changes, &test_facts);
+        Ok(())
+    })?;
 
     Ok(Analysis {
         base: base.to_string(),
@@ -78,6 +131,18 @@ pub(crate) fn analyze(
         references_after,
         test_facts,
     })
+}
+
+fn time<T>(
+    timings: &mut Option<&mut TimingRecorder>,
+    name: &'static str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.time_result(name, f)
+    } else {
+        f()
+    }
 }
 
 fn validate_parse_errors(snapshots: &[&Snapshot], options: AnalysisOptions) -> Result<()> {

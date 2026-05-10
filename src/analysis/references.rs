@@ -4,7 +4,9 @@ use crate::analysis::facts::{
 };
 use crate::analysis::modules::ModuleIndex;
 use crate::git::{ChangedFile, FileStatus};
-use crate::language::{QualifiedName, Reference, ReferenceKind, ReferenceResolution, Symbol};
+use crate::language::{
+    QualifiedName, Reference, ReferenceKind, ReferenceResolution, Symbol, SymbolKind, SymbolName,
+};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -70,17 +72,18 @@ fn reference_facts(
     let matching_references = references
         .iter()
         .filter_map(|reference| {
-            reference_match_source(reference, change, module_index).map(|match_source| {
-                MatchedReference {
+            let caller_symbol = enclosing_symbol(reference, symbols);
+            reference_match_source(reference, change, module_index, caller_symbol.as_ref()).map(
+                |match_source| MatchedReference {
                     file: reference.file.clone(),
                     line: reference.line,
-                    caller_symbol: enclosing_symbol(reference, symbols),
+                    caller_symbol,
                     kind: reference.kind,
                     resolution: reference.resolution,
                     match_source,
                     changed_file: changed_paths.contains(&reference.file),
-                }
-            })
+                },
+            )
         })
         .collect::<Vec<_>>();
     let files = matching_references
@@ -130,6 +133,7 @@ fn reference_match_source(
     reference: &Reference,
     change: &SymbolChange,
     module_index: &ModuleIndex,
+    caller_symbol: Option<&QualifiedName>,
 ) -> Option<ReferenceMatchSource> {
     let symbol = change.after.as_ref().or(change.before.as_ref());
     let Some(symbol) = symbol else {
@@ -165,7 +169,68 @@ fn reference_match_source(
         return None;
     }
 
-    (reference.name == short_name).then_some(ReferenceMatchSource::UnresolvedShortName)
+    unresolved_short_name_match(reference, symbol, &short_name, caller_symbol)
+}
+
+fn unresolved_short_name_match(
+    reference: &Reference,
+    symbol: &Symbol,
+    short_name: &SymbolName,
+    caller_symbol: Option<&QualifiedName>,
+) -> Option<ReferenceMatchSource> {
+    if reference.name != *short_name {
+        return None;
+    }
+
+    if symbol.kind == SymbolKind::Method {
+        return unresolved_same_class_method_match(reference, symbol, caller_symbol);
+    }
+
+    if is_noisy_unresolved_name(short_name.as_str()) {
+        return None;
+    }
+
+    Some(ReferenceMatchSource::UnresolvedShortName)
+}
+
+fn unresolved_same_class_method_match(
+    reference: &Reference,
+    symbol: &Symbol,
+    caller_symbol: Option<&QualifiedName>,
+) -> Option<ReferenceMatchSource> {
+    if reference.kind != ReferenceKind::Attribute || reference.file != symbol.file {
+        return None;
+    }
+
+    let receiver = reference.module.as_ref()?.to_string();
+    if receiver != "self" && receiver != "cls" {
+        return None;
+    }
+
+    let target_owner = symbol.qualified_name.as_str().rsplit_once('.')?.0;
+    let caller_owner = caller_symbol?.as_str().rsplit_once('.')?.0;
+
+    (target_owner == caller_owner).then_some(ReferenceMatchSource::UnresolvedShortName)
+}
+
+fn is_noisy_unresolved_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__call__"
+            | "__enter__"
+            | "__exit__"
+            | "__init__"
+            | "__iter__"
+            | "__next__"
+            | "close"
+            | "get"
+            | "main"
+            | "open"
+            | "read"
+            | "run"
+            | "set"
+            | "write"
+    )
 }
 
 fn count_reference_kind(references: &[MatchedReference], kind: ReferenceKind) -> usize {
@@ -223,7 +288,7 @@ mod tests {
             kinds: vec![ChangeKind::BodyChanged],
             symbol_facts: SymbolFacts {
                 kind: SymbolKind::Function,
-                visibility: SymbolVisibility::Publicish,
+                visibility: SymbolVisibility::Public,
             },
             signature_change: None,
             complexity_delta: None,
@@ -315,6 +380,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn does_not_match_unresolved_method_calls_by_short_name() {
+        let mut method = symbol(
+            "src/features.py",
+            "Formatter.format",
+            "def format(self, value):",
+            "aaa",
+        );
+        method.kind = SymbolKind::Method;
+        let mut changes = vec![SymbolChange {
+            id: SymbolId {
+                file: PathBuf::from("src/features.py"),
+                qualified_name: QualifiedName::new("Formatter.format"),
+            },
+            kinds: vec![ChangeKind::BodyChanged],
+            symbol_facts: SymbolFacts {
+                kind: SymbolKind::Method,
+                visibility: SymbolVisibility::Public,
+            },
+            signature_change: None,
+            complexity_delta: None,
+            before: Some(method.clone()),
+            after: Some(method.clone()),
+            references_before: SymbolReferenceFacts::default(),
+            references_after: SymbolReferenceFacts::default(),
+            test_references_after: SymbolReferenceFacts::default(),
+            reference_delta: Default::default(),
+            review_signals: Vec::new(),
+        }];
+        let references = vec![reference("src/other.py", "format")];
+        let module_index = ModuleIndex::from_symbols(&[method]);
+
+        attach_reference_facts(
+            &mut changes,
+            ReferenceSnapshot {
+                references: &[],
+                module_index: &module_index,
+                symbols: &[],
+            },
+            ReferenceSnapshot {
+                references: &references,
+                module_index: &module_index,
+                symbols: &[],
+            },
+            &[],
+        );
+
+        assert_eq!(changes[0].references_after.count, 0);
+    }
+
+    #[test]
+    fn matches_unresolved_same_class_self_method_calls() {
+        let mut method = symbol(
+            "src/features.py",
+            "Formatter.format",
+            "def format(self, value):",
+            "aaa",
+        );
+        method.kind = SymbolKind::Method;
+        let mut caller = symbol(
+            "src/features.py",
+            "Formatter.format_many",
+            "def format_many(self, values):",
+            "bbb",
+        );
+        caller.kind = SymbolKind::Method;
+        caller.range = LineRange { start: 10, end: 12 };
+        let mut changes = vec![SymbolChange {
+            id: SymbolId {
+                file: PathBuf::from("src/features.py"),
+                qualified_name: QualifiedName::new("Formatter.format"),
+            },
+            kinds: vec![ChangeKind::BodyChanged],
+            symbol_facts: SymbolFacts {
+                kind: SymbolKind::Method,
+                visibility: SymbolVisibility::Public,
+            },
+            signature_change: None,
+            complexity_delta: None,
+            before: Some(method.clone()),
+            after: Some(method.clone()),
+            references_before: SymbolReferenceFacts::default(),
+            references_after: SymbolReferenceFacts::default(),
+            test_references_after: SymbolReferenceFacts::default(),
+            reference_delta: Default::default(),
+            review_signals: Vec::new(),
+        }];
+        let references = vec![attribute_reference("src/features.py", "self", "format", 11)];
+        let module_index = ModuleIndex::from_symbols(&[method.clone(), caller.clone()]);
+
+        attach_reference_facts(
+            &mut changes,
+            ReferenceSnapshot {
+                references: &[],
+                module_index: &module_index,
+                symbols: &[],
+            },
+            ReferenceSnapshot {
+                references: &references,
+                module_index: &module_index,
+                symbols: &[method, caller],
+            },
+            &[],
+        );
+
+        assert_eq!(changes[0].references_after.count, 1);
+        assert_eq!(
+            changes[0].references_after.matched_references[0].caller_symbol,
+            Some(QualifiedName::new("Formatter.format_many"))
+        );
+    }
+
     fn symbol(file: &str, name: &str, signature: &str, body_hash: &str) -> Symbol {
         Symbol {
             file: PathBuf::from(file),
@@ -338,6 +515,19 @@ mod tests {
             resolution: ReferenceResolution::Unresolved,
             line: 1,
             kind: ReferenceKind::Call,
+        }
+    }
+
+    fn attribute_reference(file: &str, module: &str, name: &str, line: usize) -> Reference {
+        Reference {
+            file: PathBuf::from(file),
+            name: SymbolName::new(name),
+            module: Some(crate::language::ModuleName::new(module)),
+            resolved_name: Some(SymbolName::new(name)),
+            resolved_module: Some(crate::language::ModuleName::new(module)),
+            resolution: ReferenceResolution::Unresolved,
+            line,
+            kind: ReferenceKind::Attribute,
         }
     }
 }

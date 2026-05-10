@@ -122,7 +122,8 @@ pub(crate) struct SymbolFacts {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SymbolVisibility {
     Private,
-    Publicish,
+    Internal,
+    Public,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -135,6 +136,21 @@ pub(crate) struct SignatureChangeFacts {
     pub(crate) parameter_annotation_changed: Vec<String>,
     pub(crate) return_annotation_changed: bool,
     pub(crate) async_changed: bool,
+}
+
+impl SignatureChangeFacts {
+    pub(crate) fn has_runtime_change(&self) -> bool {
+        self.async_changed
+            || !self.parameters_added.is_empty()
+            || !self.parameters_removed.is_empty()
+            || self.parameters_reordered
+            || !self.parameter_kind_changed.is_empty()
+            || !self.parameter_default_changed.is_empty()
+    }
+
+    pub(crate) fn has_type_annotation_change(&self) -> bool {
+        !self.parameter_annotation_changed.is_empty() || self.return_annotation_changed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -151,13 +167,44 @@ pub(crate) struct ComplexityDelta {
     pub(crate) max_nesting_depth_delta: isize,
 }
 
+pub(crate) const REVIEW_COMPLEXITY_DELTA_THRESHOLD: isize = 2;
+
+impl ComplexityDelta {
+    pub(crate) fn has_reportable_structural_change(&self) -> bool {
+        self.structural_deltas()
+            .iter()
+            .any(|delta| delta.abs() >= REVIEW_COMPLEXITY_DELTA_THRESHOLD)
+    }
+
+    pub(crate) fn has_reportable_structural_increase(&self) -> bool {
+        self.structural_deltas()
+            .iter()
+            .any(|delta| *delta >= REVIEW_COMPLEXITY_DELTA_THRESHOLD)
+    }
+
+    fn structural_deltas(&self) -> [isize; 7] {
+        [
+            self.branch_count_delta,
+            self.loop_count_delta,
+            self.boolean_operator_count_delta,
+            self.exception_handler_count_delta,
+            self.match_count_delta,
+            self.with_count_delta,
+            self.max_nesting_depth_delta,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReviewSignal {
+    PublicSymbolAdded,
+    PublicSymbolDeleted,
     PublicSignatureChanged,
+    TypeAnnotationsChanged,
     SignatureChangedWithUnchangedCallers,
     ComplexityIncreased,
-    LogicChangedWithoutTestMovement,
+    ImplementationChangedWithoutTestMovement,
     PathChangedOnly,
 }
 

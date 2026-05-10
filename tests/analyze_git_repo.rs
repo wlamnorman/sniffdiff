@@ -1,15 +1,16 @@
 use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 use std::collections::BTreeMap;
 
+mod common;
+
+use common::TestRepo;
 use serde_json::Value;
 use sniffdiff::{
-    PublicAnalysisOptions, ReportLimit, analyze_repo_json, analyze_repo_report,
-    analyze_repo_report_verbose,
+    INDEX_REF, PublicAnalysisOptions, ReportLimit, ReportVerbosity, WORKTREE_REF,
+    analyze_repo_json, analyze_repo_raw_json as analyze_repo_json_facts, analyze_repo_report,
+    analyze_repo_report_verbose, merge_base,
 };
-use tempfile::TempDir;
 
 #[test]
 fn analyzes_symbols_before_and_after_from_real_git_refs() {
@@ -136,7 +137,8 @@ def test_build_features_strict():
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let error =
-        analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap_err();
+        analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap_err();
     assert!(error.to_string().contains("Python parse errors found"));
     assert!(error.to_string().contains("src/broken.py"));
     assert!(error.to_string().contains("--allow-parse-errors"));
@@ -151,10 +153,10 @@ def test_build_features_strict():
         },
     )
     .unwrap();
-    assert!(partial_report.contains("parse_errors: 1 files"));
+    assert!(partial_report.contains("parse_errors:\n  files: 1"));
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(
+        &analyze_repo_json_facts(
             repo.path(),
             &base,
             &head,
@@ -199,7 +201,7 @@ def test_build_features_strict():
     let build_features = changes["build_features"];
     assert_symbol_change_json_shape(build_features);
     assert_eq!(build_features["kind"], "function");
-    assert_eq!(build_features["visibility"], "publicish");
+    assert_eq!(build_features["visibility"], "public");
     assert_eq!(
         string_array(&build_features["signature_change"]["parameters_added"]),
         vec!["strict"]
@@ -267,7 +269,6 @@ def test_build_features_strict():
         vec![
             "public_signature_changed",
             "signature_changed_with_unchanged_callers",
-            "complexity_increased",
         ]
     );
     assert_eq!(
@@ -322,6 +323,26 @@ def consume(rows):
         "pkg/attribute_consumer.py",
         r#"
 import pkg.features as features
+
+
+def consume(rows):
+    return features.build_features(rows)
+"#,
+    );
+    repo.write(
+        "pkg/unaliased_module_consumer.py",
+        r#"
+import pkg.features
+
+
+def consume(rows):
+    return pkg.features.build_features(rows)
+"#,
+    );
+    repo.write(
+        "pkg/from_module_consumer.py",
+        r#"
+from pkg import features
 
 
 def consume(rows):
@@ -388,15 +409,16 @@ def test_build_features_strict():
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap(),
+        &analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap(),
     )
     .unwrap();
     let changes = changes_by_name(&analysis);
     let build_features = changes["build_features"];
 
     assert_eq!(analysis["schema_version"], 1);
-    assert_eq!(analysis["before"]["files_parsed"], 6);
-    assert_eq!(analysis["after"]["files_parsed"], 6);
+    assert_eq!(analysis["before"]["files_parsed"], 8);
+    assert_eq!(analysis["after"]["files_parsed"], 8);
     assert_eq!(analysis["before"]["files_skipped"], 1);
     assert_eq!(analysis["after"]["files_skipped"], 1);
     assert_kinds(build_features, &["body_changed", "signature_changed"]);
@@ -404,10 +426,10 @@ def test_build_features_strict():
         string_array(&build_features["signature_change"]["parameters_added"]),
         vec!["strict"]
     );
-    assert_eq!(build_features["references_after"]["count"], 6);
-    assert_eq!(build_features["references_before"]["count"], 6);
+    assert_eq!(build_features["references_after"]["count"], 8);
+    assert_eq!(build_features["references_before"]["count"], 8);
     assert_eq!(build_features["reference_delta"]["count_delta"], 0);
-    assert_eq!(build_features["references_after"]["resolved_count"], 5);
+    assert_eq!(build_features["references_after"]["resolved_count"], 7);
     assert_eq!(build_features["references_after"]["unresolved_count"], 1);
     assert_eq!(build_features["test_references_after"]["count"], 3);
     assert_eq!(
@@ -422,8 +444,10 @@ def test_build_features_strict():
         string_array(&build_features["references_after"]["unchanged_files"]),
         vec![
             "pkg/attribute_consumer.py",
+            "pkg/from_module_consumer.py",
             "pkg/runner.py",
             "pkg/sub/consumer.py",
+            "pkg/unaliased_module_consumer.py",
             "pkg/unresolved_consumer.py",
         ]
     );
@@ -448,6 +472,22 @@ def test_build_features_strict():
     assert!(references.iter().any(|reference| {
         reference["file"] == "pkg/sub/consumer.py"
             && reference["name"] == "make_features"
+            && reference["resolved_module"] == "pkg.features"
+            && reference["resolved_name"] == "build_features"
+            && reference["resolution"] == "resolved"
+    }));
+    assert!(references.iter().any(|reference| {
+        reference["file"] == "pkg/unaliased_module_consumer.py"
+            && reference["name"] == "build_features"
+            && reference["module"] == "pkg.features"
+            && reference["resolved_module"] == "pkg.features"
+            && reference["resolved_name"] == "build_features"
+            && reference["resolution"] == "resolved"
+    }));
+    assert!(references.iter().any(|reference| {
+        reference["file"] == "pkg/from_module_consumer.py"
+            && reference["name"] == "build_features"
+            && reference["module"] == "features"
             && reference["resolved_module"] == "pkg.features"
             && reference["resolved_name"] == "build_features"
             && reference["resolution"] == "resolved"
@@ -578,32 +618,30 @@ def export_summary(rows):
     let report =
         analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
 
-    assert!(report.starts_with("Sniffed the diff..."));
-    assert!(report.contains("scope: 3 changed files"));
-    assert!(report.contains("0 changed test files"));
+    assert!(report.starts_with("schema_version: 1"));
+    assert!(report.contains("verbosity: normal"));
+    assert!(report.contains("scope:\n  changed_files: 3"));
+    assert!(report.contains("changed_test_files: 0"));
     assert!(!report.contains("opinion:"));
     assert!(!report.contains("range:"));
     assert!(!report.contains("Imports:"));
     assert!(!report.contains("new external:"));
     assert!(!report.contains("new internal:"));
     assert!(!report.contains("removed imports:"));
-    assert!(!report.contains("inspect:"));
-    assert!(report.contains("- pkg/features.py::build_features"));
-    assert!(report.contains("change: public signature changed; logic changed"));
-    assert!(
-        report.contains("signature: build_features(rows) -> build_features(rows, *, strict=False)")
-    );
+    assert!(report.contains("inspect:"));
+    assert!(report.contains("- symbol: pkg/features.py::build_features"));
+    assert!(report.contains("changes:\n  - public signature\n  - implementation"));
+    assert!(report.contains("signature:\n    before: build_features(rows)\n    after: build_features(rows, *, strict=False)"));
+    assert!(report.contains("complexity:\n    status: increased"));
+    assert!(report.contains("name: nesting\n      before: 0\n      after: 2"));
+    assert!(report.contains("tests: no direct test references found"));
     assert!(report.contains(
-        "complexity: increased; branches 0 -> 1; loops 0 -> 1; bool_ops 0 -> 1; nesting 0 -> 2"
+        "unchanged_callers:\n  - pkg/alias_consumer.py::consume\n  - pkg/runner.py::run"
     ));
-    assert!(report.contains("tests: no nearby test movement"));
-    assert!(
-        report.contains("unchanged_callers: pkg/alias_consumer.py::consume (1 callsite), pkg/runner.py::run (1 callsite)")
-    );
+    assert!(report.contains("changes:\n  - added public function"));
     assert!(!report.contains("fetch:"));
     assert!(!report.contains("coverage_risk:"));
-    assert!(report.contains("path-only or low-signal symbol changes"));
-    assert!(report.contains("use --json for exhaustive facts"));
+    assert!(!report.contains("omitted:"));
 
     let limited = analyze_repo_report(
         repo.path(),
@@ -617,15 +655,82 @@ def export_summary(rows):
     .unwrap();
     assert_eq!(limited.matches("\n- ").count(), 1);
     assert!(limited.contains("use --limit"));
-    assert!(limited.contains("more items"));
+    assert!(limited.contains("show all high-signal items"));
 
     let verbose =
         analyze_repo_report_verbose(repo.path(), &base, &head, PublicAnalysisOptions::default())
             .unwrap();
-    assert!(!verbose.contains("inspect:"));
+    assert!(verbose.contains("inspect:"));
     assert!(verbose.contains("pkg/features.py::build_features"));
-    assert!(verbose.contains("change_kinds: body changed, signature changed"));
-    assert!(verbose.contains("references: before"));
+    assert!(verbose.contains("change_kinds:\n    - body changed\n    - signature changed"));
+    assert!(verbose.contains("references:\n      before:"));
+}
+
+#[test]
+fn groups_added_class_methods_under_class_in_report() {
+    let repo = TestRepo::new();
+    repo.write("README.md", "base\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/exceptions.py",
+        r#"
+class NoSuchCommand(Exception):
+    def __init__(self, name):
+        if not name:
+            raise ValueError("missing name")
+        self.name = name
+
+    def format_message(self):
+        if self.name:
+            return f"No such command: {self.name}"
+        return "No such command"
+"#,
+    );
+    repo.write(
+        "pkg/core.py",
+        r#"
+from pkg.exceptions import NoSuchCommand
+
+
+def resolve_command(name):
+    raise NoSuchCommand(name)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&report).unwrap();
+    let inspect = yaml["inspect"].as_sequence().unwrap();
+
+    assert!(
+        inspect
+            .iter()
+            .any(|item| item["symbol"] == "pkg/exceptions.py::NoSuchCommand"
+                && item["members"].as_sequence().is_some_and(|members| {
+                    members.len() == 2
+                        && members[0]["name"] == "__init__"
+                        && members[1]["name"] == "format_message"
+                        && members[0]["changes"][0] == "added public method"
+                        && members[1]["changes"][0] == "added public method"
+                }))
+    );
+    assert!(
+        !inspect
+            .iter()
+            .any(|item| item["symbol"] == "pkg/exceptions.py::NoSuchCommand.__init__")
+    );
+    assert!(
+        !inspect
+            .iter()
+            .any(|item| item["symbol"] == "pkg/exceptions.py::NoSuchCommand.format_message")
+    );
+    assert!(yaml.get("omitted").is_none());
 }
 
 #[test]
@@ -689,7 +794,7 @@ def third(rows):
     )
     .unwrap();
     assert_eq!(report_item_count(&limited), 2);
-    assert!(limited.contains("use --limit 3 for more items"));
+    assert!(limited.contains("use --limit 3 to show all high-signal items"));
 
     let all = analyze_repo_report(
         repo.path(),
@@ -715,7 +820,328 @@ def third(rows):
     )
     .unwrap();
     assert_eq!(report_item_count(&verbose_limited), 2);
-    assert!(verbose_limited.contains("change_kinds: body changed"));
+    assert!(verbose_limited.contains("change_kinds:\n    - body changed"));
+}
+
+#[test]
+fn json_output_uses_the_same_report_model_and_verbosity_levels() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    if strict and not rows:
+        return []
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report: Value = serde_json::from_str(
+        &analyze_repo_json(
+            repo.path(),
+            &base,
+            &head,
+            PublicAnalysisOptions {
+                report_verbosity: ReportVerbosity::Verbose,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["verbosity"], "verbose");
+    assert_eq!(report["scope"]["changed_symbols"], 1);
+    assert_eq!(
+        report["inspect"][0]["symbol"],
+        "pkg/features.py::build_features"
+    );
+    assert_eq!(
+        string_array(&report["inspect"][0]["facts"]["change_kinds"]),
+        vec!["body changed", "signature changed"]
+    );
+}
+
+#[test]
+fn analyzes_ref_against_worktree_like_git_diff_ref() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    if strict and not rows:
+        return []
+    return list(rows)
+"#,
+    );
+    repo.write(
+        "pkg/new_module.py",
+        r#"
+def added_helper():
+    return "new"
+"#,
+    );
+    repo.git(&["add", "pkg/new_module.py"]);
+    repo.write(
+        "pkg/untracked.py",
+        r#"
+def ignored_by_git_diff():
+    return "untracked"
+"#,
+    );
+
+    let report = analyze_repo_report(
+        repo.path(),
+        &base,
+        WORKTREE_REF,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 2"));
+    assert!(report.contains("changed_symbols: 2"));
+    assert!(report.contains("- symbol: pkg/features.py::build_features"));
+    assert!(report.contains("- symbol: pkg/new_module.py::added_helper"));
+    assert!(!report.contains("pkg/untracked.py::ignored_by_git_diff"));
+    assert!(report.contains("changes:\n  - added public function"));
+}
+
+#[test]
+fn analyzes_index_against_worktree_like_git_diff_without_args() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "pkg/features.py"]);
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False, source="unknown"):
+    return list(rows)
+"#,
+    );
+    repo.write(
+        "pkg/untracked.py",
+        r#"
+def ignored_by_git_diff():
+    return "untracked"
+"#,
+    );
+
+    let report = analyze_repo_report(
+        repo.path(),
+        INDEX_REF,
+        WORKTREE_REF,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 1"));
+    assert!(report.contains("before: build_features(rows, *, strict=False)"));
+    assert!(report.contains("after: build_features(rows, *, strict=False, source=\"unknown\")"));
+    assert!(!report.contains("pkg/untracked.py::ignored_by_git_diff"));
+}
+
+#[test]
+fn analyzes_head_against_index_like_git_diff_staged() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "pkg/features.py"]);
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False, source="unknown"):
+    return list(rows)
+"#,
+    );
+
+    let report = analyze_repo_report(
+        repo.path(),
+        "HEAD",
+        INDEX_REF,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 1"));
+    assert!(report.contains("before: build_features(rows)"));
+    assert!(report.contains("after: build_features(rows, *, strict=False)"));
+    assert!(!report.contains("source=\"unknown\""));
+}
+
+#[test]
+fn reports_deleted_symbols_against_worktree() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def removed_helper():
+    return "removed"
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    fs::remove_file(repo.path().join("pkg/features.py")).unwrap();
+
+    let report = analyze_repo_report(
+        repo.path(),
+        &base,
+        WORKTREE_REF,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 1"));
+    assert!(report.contains("- symbol: pkg/features.py::removed_helper"));
+    assert!(report.contains("changes:\n  - deleted public function"));
+}
+
+#[test]
+fn reports_deleted_symbols_against_index() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def removed_helper():
+    return "removed"
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+
+    repo.git(&["rm", "pkg/features.py"]);
+
+    let report = analyze_repo_report(
+        repo.path(),
+        "HEAD",
+        INDEX_REF,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 1"));
+    assert!(report.contains("- symbol: pkg/features.py::removed_helper"));
+    assert!(report.contains("changes:\n  - deleted public function"));
+}
+
+#[test]
+fn resolves_triple_dot_base_like_git_diff() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    if rows is None:
+        return []
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "main side"]);
+    let main_side = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.git(&["checkout", "-b", "feature", &base]);
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    if strict and not rows:
+        return []
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "feature side"]);
+    let feature_side = repo.git(&["rev-parse", "HEAD"]);
+
+    let resolved_base = merge_base(repo.path(), &main_side, &feature_side).unwrap();
+    assert_eq!(resolved_base, base);
+
+    let report = analyze_repo_report(
+        repo.path(),
+        &resolved_base,
+        &feature_side,
+        PublicAnalysisOptions::default(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("- symbol: pkg/features.py::build_features"));
+    assert!(report.contains("before: build_features(rows)"));
+    assert!(report.contains("after: build_features(rows, *, strict=False)"));
 }
 
 #[test]
@@ -768,10 +1194,57 @@ def build_features(rows, *, strict=False):
     )
     .unwrap();
 
-    assert!(report.contains(
-        "unchanged_callers: pkg/api.py::run (1 callsite), pkg/batch.py::run (1 callsite), +1 more"
-    ));
+    assert!(
+        report.contains(
+            "unchanged_callers:\n  - pkg/api.py::run\n  - pkg/batch.py::run\n  - +1 more"
+        )
+    );
     assert!(!report.contains("pkg/pipeline.py::run"));
+}
+
+#[test]
+fn repeated_callers_show_callsite_count() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows):
+    return list(rows)
+"#,
+    );
+    repo.write(
+        "pkg/api.py",
+        r#"
+from pkg.features import build_features
+
+
+def run(rows):
+    left = build_features(rows)
+    right = build_features(rows)
+    return left + right
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    if strict and not rows:
+        return []
+    return list(rows)
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("unchanged_callers:\n  - pkg/api.py::run (2 callsites)"));
 }
 
 #[test]
@@ -795,11 +1268,120 @@ def stable_helper():
     let report =
         analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
 
-    assert!(report.contains("scope: 1 changed file, 1 changed symbol, 0 changed test files"));
-    assert!(report.contains("\n- none\n"));
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 1"));
+    assert!(report.contains("changed_test_files: 0"));
+    assert!(!report.contains("inspect:"));
     assert!(report.contains(
-        "omitted: 1 path-only or low-signal symbol changes; use --json for exhaustive facts"
+        "omitted:\n  symbol_changes: 1\n  low_signal: 1\n  hint: use --format json --verbosity full for full details"
     ));
+}
+
+#[test]
+fn report_explains_when_range_has_no_changed_python_files() {
+    let repo = TestRepo::new();
+    repo.write("README.md", "before\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write("README.md", "after\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 0"));
+    assert!(report.contains("changed_test_files: 0"));
+    assert!(!report.contains("inspect:"));
+    assert!(
+        report.contains("No Python file changes inside sniffdiff's symbol model were detected.")
+    );
+}
+
+#[test]
+fn report_explains_when_python_changes_have_no_symbol_changes() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/settings.py",
+        r#"
+FEATURE_FLAG = False
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/settings.py",
+        r#"
+FEATURE_FLAG = True
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 0"));
+    assert!(report.contains("changed_test_files: 0"));
+    assert!(!report.contains("inspect:"));
+    assert!(
+        report.contains("No Python file changes inside sniffdiff's symbol model were detected.")
+    );
+}
+
+#[test]
+fn formatting_only_python_changes_do_not_create_symbol_changes() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(rows, *, strict=False):
+    value = rows[0]
+    return value
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def build_features(
+    rows,
+    *,
+    strict=False,
+):
+    value=rows[0]
+
+    # formatting/comment-only change
+    return value
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+    let analysis: Value = serde_json::from_str(
+        &analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(report.contains("changed_files: 1"));
+    assert!(report.contains("changed_symbols: 0"));
+    assert!(report.contains("changed_test_files: 0"));
+    assert_eq!(analysis["symbol_changes"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -841,7 +1423,8 @@ def build_features(rows, *, strict=False):
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap(),
+        &analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap(),
     )
     .unwrap();
     let changes = changes_by_name(&analysis);
@@ -856,11 +1439,8 @@ def build_features(rows, *, strict=False):
 
     let report =
         analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
-    assert!(
-        report
-            .contains("unchanged_tests: tests/test_features.py::test_build_features (1 callsite)")
-    );
-    assert!(report.contains("tests: no nearby test movement"));
+    assert!(report.contains("unchanged_tests:\n  - tests/test_features.py::test_build_features"));
+    assert!(!report.contains("tests: no direct test references found"));
 }
 
 #[test]
@@ -895,7 +1475,8 @@ def test_broken(:
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let error =
-        analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap_err();
+        analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap_err();
     assert!(error.to_string().contains("tests/test_features.py"));
 
     let report = analyze_repo_report(
@@ -908,10 +1489,10 @@ def test_broken(:
         },
     )
     .unwrap();
-    assert!(report.contains("parse_errors: 1 files"));
+    assert!(report.contains("parse_errors:\n  files: 1"));
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(
+        &analyze_repo_json_facts(
             repo.path(),
             &base,
             &head,
@@ -968,9 +1549,129 @@ async def load():
     let report =
         analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
 
-    assert!(report.contains("- pkg/tasks.py::load"));
-    assert!(report.contains("signature: async changed; load() -> async load()"));
-    assert!(report.contains("unchanged_callers: pkg/consumer.py::run (1 callsite)"));
+    assert!(report.contains("- symbol: pkg/tasks.py::load"));
+    assert!(report.contains("signature:\n    before: load()\n    after: async load()"));
+    assert!(report.contains("unchanged_callers:\n  - pkg/consumer.py::run"));
+}
+
+#[test]
+fn renders_annotation_only_signature_changes_as_type_annotations() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/features.py",
+        r#"
+def normalize(row):
+    return row
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/features.py",
+        r#"
+def normalize(row: dict[str, object]) -> dict[str, object]:
+    return row
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("- symbol: pkg/features.py::normalize"));
+    assert!(report.contains(
+        "changes:\n  - 'type annotations (row: unannotated -> dict[str, object]; return: unannotated -> dict[str, object])'"
+    ));
+    assert!(!report.contains("- public signature"));
+    assert!(report.contains("before: normalize(row)"));
+    assert!(report.contains("after: 'normalize(row: dict[str, object]) -> dict[str, object]'"));
+}
+
+#[test]
+fn renders_parameter_type_annotation_delta_in_change_label() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/errors.py",
+        r#"
+import collections.abc as cabc
+
+
+class NoSuchOption(Exception):
+    def __init__(self, possibilities: cabc.Sequence[str] | None = None) -> None:
+        self.possibilities = possibilities
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/errors.py",
+        r#"
+import collections.abc as cabc
+
+
+class NoSuchOption(Exception):
+    def __init__(self, possibilities: cabc.Iterable[str] | None = None) -> None:
+        self.possibilities = possibilities
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("- symbol: pkg/errors.py::NoSuchOption.__init__"));
+    assert!(report.contains(
+        "changes:\n  - 'type annotation (possibilities: cabc.Sequence[str] | None -> cabc.Iterable[str] | None)'"
+    ));
+}
+
+#[test]
+fn renders_multiline_signature_changes_as_before_after_report_block() {
+    let repo = TestRepo::new();
+    repo.write(
+        "pkg/leaderboard.py",
+        r#"
+def display_player(
+    record: str,
+    *,
+    current_player_id: str,
+) -> str:
+    return record
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    repo.write(
+        "pkg/leaderboard.py",
+        r#"
+def display_player(record: str) -> str:
+    if not record:
+        return ""
+    return record
+"#,
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "head"]);
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let report =
+        analyze_repo_report(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap();
+
+    assert!(report.contains("- symbol: pkg/leaderboard.py::display_player"));
+    assert!(
+        report.contains("before: 'display_player(record: str, *, current_player_id: str) -> str'")
+    );
+    assert!(report.contains("after: 'display_player(record: str) -> str'"));
 }
 
 #[test]
@@ -1016,7 +1717,8 @@ def build_features(rows, *, strict=False):
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap(),
+        &analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap(),
     )
     .unwrap();
     let changes = changes_by_file_and_name(&analysis);
@@ -1031,10 +1733,7 @@ def build_features(rows, *, strict=False):
     );
     assert_eq!(
         string_array(&build_features["review_signals"]),
-        vec![
-            "public_signature_changed",
-            "logic_changed_without_test_movement"
-        ]
+        vec!["public_signature_changed"]
     );
 }
 
@@ -1095,7 +1794,8 @@ def consume(rows):
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let analysis: Value = serde_json::from_str(
-        &analyze_repo_json(repo.path(), &base, &head, PublicAnalysisOptions::default()).unwrap(),
+        &analyze_repo_json_facts(repo.path(), &base, &head, PublicAnalysisOptions::default())
+            .unwrap(),
     )
     .unwrap();
     let changes = changes_by_file_and_name(&analysis);
@@ -1233,47 +1933,8 @@ fn assert_symbol_change_json_shape(change: &Value) {
 }
 
 fn report_item_count(report: &str) -> usize {
-    report.lines().filter(|line| line.starts_with("- ")).count()
-}
-
-struct TestRepo {
-    dir: TempDir,
-}
-
-impl TestRepo {
-    fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let repo = Self { dir };
-        repo.git(&["init"]);
-        repo.git(&["config", "user.email", "test@example.com"]);
-        repo.git(&["config", "user.name", "Test User"]);
-        repo
-    }
-
-    fn path(&self) -> &Path {
-        self.dir.path()
-    }
-
-    fn write(&self, path: &str, content: &str) {
-        let path = self.path().join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content.trim_start()).unwrap();
-    }
-
-    fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(self.path())
-            .output()
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    report
+        .lines()
+        .filter(|line| line.starts_with("- symbol: "))
+        .count()
 }

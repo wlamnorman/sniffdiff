@@ -22,7 +22,6 @@ impl QualifiedName {
         Self(value.into())
     }
 
-    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -66,6 +65,10 @@ pub(crate) struct ModuleName(String);
 impl ModuleName {
     pub(crate) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -154,6 +157,7 @@ pub(crate) struct ParameterFacts {
     pub(crate) name: String,
     pub(crate) kind: ParameterKind,
     pub(crate) has_default: bool,
+    pub(crate) default_value: Option<String>,
     pub(crate) annotation: Option<String>,
 }
 

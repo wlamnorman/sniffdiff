@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::analysis::facts::{
     ChangeKind, ComplexityDelta, SignatureChangeFacts, SymbolChange, SymbolFacts, SymbolId,
@@ -52,17 +52,43 @@ pub(crate) fn diff_symbols(
 
 fn symbol_facts(before: Option<&Symbol>, after: Option<&Symbol>) -> SymbolFacts {
     let symbol = after.or(before).expect("symbol facts require one side");
-    let short_name = symbol.qualified_name.short_name();
-    let is_private = short_name.as_str().starts_with('_');
 
     SymbolFacts {
         kind: symbol.kind,
-        visibility: if is_private {
-            SymbolVisibility::Private
-        } else {
-            SymbolVisibility::Publicish
-        },
+        visibility: symbol_visibility(symbol),
     }
+}
+
+fn symbol_visibility(symbol: &Symbol) -> SymbolVisibility {
+    if symbol
+        .qualified_name
+        .as_str()
+        .split('.')
+        .any(is_private_identifier)
+    {
+        SymbolVisibility::Private
+    } else if is_internal_path(&symbol.file) {
+        SymbolVisibility::Internal
+    } else {
+        SymbolVisibility::Public
+    }
+}
+
+fn is_private_identifier(name: &str) -> bool {
+    name.starts_with('_') && !(name.starts_with("__") && name.ends_with("__"))
+}
+
+fn is_internal_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy();
+        is_private_identifier(path_component_stem(&component))
+    })
+}
+
+fn path_component_stem(component: &str) -> &str {
+    component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
 }
 
 fn symbol_index<'a>(
@@ -108,12 +134,21 @@ fn change_kinds(id: &SymbolId, before: Option<&Symbol>, after: Option<&Symbol>) 
             if before.body_hash != after.body_hash {
                 kinds.push(ChangeKind::BodyChanged);
             }
-            if before.signature != after.signature {
+            if signature_changed(before, after) {
                 kinds.push(ChangeKind::SignatureChanged);
             }
             kinds
         }
         (None, None) => Vec::new(),
+    }
+}
+
+fn signature_changed(before: &Symbol, after: &Symbol) -> bool {
+    match (&before.signature_facts, &after.signature_facts) {
+        (Some(before), Some(after)) => {
+            compare_signatures(before, after) != SignatureChangeFacts::default()
+        }
+        _ => before.signature != after.signature,
     }
 }
 
@@ -174,7 +209,7 @@ fn compare_signatures(
         if before.kind != after.kind {
             parameter_kind_changed.push((*name).to_string());
         }
-        if before.has_default != after.has_default {
+        if before.default_value != after.default_value {
             parameter_default_changed.push((*name).to_string());
         }
         if before.annotation != after.annotation {
@@ -347,6 +382,123 @@ mod tests {
     }
 
     #[test]
+    fn ignores_raw_signature_formatting_when_structured_signature_is_unchanged() {
+        let mut before = symbol(
+            "src/app.py",
+            "build",
+            "def build(rows, *, strict=False):",
+            "same-body",
+        );
+        before.signature_facts = Some(FunctionSignatureFacts {
+            is_async: false,
+            parameters: vec![
+                parameter("rows", ParameterKind::PositionalOrKeyword, false, None),
+                parameter("strict", ParameterKind::KeywordOnly, true, None),
+            ],
+            return_annotation: None,
+        });
+        let mut after = symbol(
+            "src/app.py",
+            "build",
+            "def build(\n    rows,\n    *,\n    strict=False,\n):",
+            "same-body",
+        );
+        after.signature_facts = before.signature_facts.clone();
+
+        let changes = diff_symbols(&[before], &[after], &[]);
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn reports_default_value_changes_as_signature_changes() {
+        let mut before = symbol(
+            "src/app.py",
+            "build",
+            "def build(rows, *, strict=False):",
+            "same-body",
+        );
+        before.signature_facts = Some(FunctionSignatureFacts {
+            is_async: false,
+            parameters: vec![
+                parameter("rows", ParameterKind::PositionalOrKeyword, false, None),
+                parameter_with_default("strict", ParameterKind::KeywordOnly, "False", None),
+            ],
+            return_annotation: None,
+        });
+        let mut after = symbol(
+            "src/app.py",
+            "build",
+            "def build(rows, *, strict=True):",
+            "same-body",
+        );
+        after.signature_facts = Some(FunctionSignatureFacts {
+            is_async: false,
+            parameters: vec![
+                parameter("rows", ParameterKind::PositionalOrKeyword, false, None),
+                parameter_with_default("strict", ParameterKind::KeywordOnly, "True", None),
+            ],
+            return_annotation: None,
+        });
+
+        let changes = diff_symbols(&[before], &[after], &[]);
+
+        assert_eq!(changes[0].kinds, vec![ChangeKind::SignatureChanged]);
+        assert_eq!(
+            changes[0]
+                .signature_change
+                .as_ref()
+                .unwrap()
+                .parameter_default_changed,
+            vec!["strict"]
+        );
+    }
+
+    #[test]
+    fn classifies_visibility_from_symbol_and_module_names() {
+        let mut public_dunder_method = symbol(
+            "src/models.py",
+            "User.__init__",
+            "def __init__(self):",
+            "aaa",
+        );
+        public_dunder_method.kind = SymbolKind::Method;
+        let private_function = symbol("src/models.py", "_normalize", "def _normalize():", "bbb");
+        let internal_function = symbol("src/_compat.py", "adapt", "def adapt():", "ccc");
+        let init_export = symbol(
+            "src/package/__init__.py",
+            "exported",
+            "def exported():",
+            "ddd",
+        );
+
+        let changes = diff_symbols(
+            &[],
+            &[
+                public_dunder_method,
+                private_function,
+                internal_function,
+                init_export,
+            ],
+            &[],
+        );
+        let by_name = changes
+            .iter()
+            .map(|change| {
+                (
+                    change.id.qualified_name.as_str(),
+                    change.symbol_facts.visibility,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(by_name["User.__init__"], SymbolVisibility::Public);
+        assert_eq!(by_name["_normalize"], SymbolVisibility::Private);
+        assert_eq!(by_name["adapt"], SymbolVisibility::Internal);
+        assert_eq!(by_name["exported"], SymbolVisibility::Public);
+    }
+
+    #[test]
     fn reports_complexity_delta_facts() {
         let mut before = symbol("src/app.py", "build", "def build(rows):", "aaa");
         before.complexity = ComplexityMetrics {
@@ -404,6 +556,22 @@ mod tests {
             name: name.to_string(),
             kind,
             has_default,
+            default_value: has_default.then(|| "default".to_string()),
+            annotation: annotation.map(ToOwned::to_owned),
+        }
+    }
+
+    fn parameter_with_default(
+        name: &str,
+        kind: ParameterKind,
+        default_value: &str,
+        annotation: Option<&str>,
+    ) -> ParameterFacts {
+        ParameterFacts {
+            name: name.to_string(),
+            kind,
+            has_default: true,
+            default_value: Some(default_value.to_string()),
             annotation: annotation.map(ToOwned::to_owned),
         }
     }

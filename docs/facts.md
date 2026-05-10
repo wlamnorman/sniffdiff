@@ -5,7 +5,8 @@ intended to be review-relevant facts, not a ranking.
 
 ## Snapshots
 
-Each Git ref is parsed independently into a `Snapshot`:
+Each side of the comparison is parsed independently into a `Snapshot`. A side
+can be a Git ref, the Git index, or the working tree:
 
 - files considered;
 - files skipped by the default file filter;
@@ -56,8 +57,11 @@ moved without a Git-detected file rename currently appear as `deleted` + `added`
 Each changed symbol includes:
 
 - `kind`: `function`, `method`, or `class`;
-- `visibility`: `private` when the short symbol name starts with `_`,
-  otherwise `publicish`.
+- `visibility`: `private`, `internal`, or `public`.
+
+Visibility is heuristic. A private symbol has a non-dunder qualified-name
+component starting with `_`. An internal symbol lives under a path component
+starting with `_`. Everything else is currently treated as public.
 
 Each extracted function or method symbol also carries structured signature
 facts:
@@ -67,6 +71,7 @@ facts:
 - parameter kind: positional-only, positional-or-keyword, keyword-only, varargs,
   or kwargs;
 - whether each parameter has a default;
+- the normalized default value, when present;
 - parameter annotations;
 - return annotation.
 
@@ -82,6 +87,10 @@ Symbols also carry raw complexity metrics:
 - max nesting depth.
 
 These are raw facts only. They are not risk scores.
+
+The JSON keeps the raw deltas. The concise text report only displays structural
+complexity metrics whose absolute delta is at least 2, to avoid over-weighting
+one-point noise.
 
 The concise text report should render structural movement rather than a single
 opaque complexity total, for example:
@@ -117,6 +126,8 @@ numeric delta per metric.
 Production references are extracted from the before and after production
 snapshots. The Python adapter tracks simple import bindings and aliases so
 references can be matched with better precision than short-name matching alone.
+Bindings are scope-aware enough to keep function-local imports from leaking into
+later functions.
 
 Current reference kinds:
 
@@ -124,6 +135,22 @@ Current reference kinds:
 - `from_import`: `from x import y`;
 - `call`: `y(...)`;
 - `attribute`: `x.y(...)`.
+
+Current Python import resolution handles common direct and module-style calls,
+including:
+
+- `from pkg.features import build_features` followed by `build_features(...)`;
+- `from pkg.features import build_features as make_features` followed by
+  `make_features(...)`;
+- `import pkg.features as features` followed by `features.build_features(...)`;
+- `import pkg.features` followed by `pkg.features.build_features(...)`;
+- `from pkg import features` followed by `features.build_features(...)`.
+- relative forms such as `from .. import features` followed by
+  `features.build_features(...)`.
+
+Import bindings are scoped. Function-local imports are visible inside nested
+functions, but not to later sibling functions. Class-body imports are visible
+inside the class body, but are not treated as lexical bindings inside methods.
 
 Each reference includes:
 
@@ -168,8 +195,8 @@ reference-fact shape as production references. The concise report may render:
   symbol;
 - `unchanged_tests`: existing unchanged test functions that still call the
   changed production symbol;
-- `tests: no nearby test movement` when production logic moved without a nearby
-  changed test file.
+- `tests: no direct test references found` when no changed or unchanged test
+  reference matched the changed production symbol.
 
 Nearby test movement is intentionally heuristic. For now, `tests/test_features.py`
 is considered nearby `features.py`.
@@ -181,13 +208,19 @@ Review signals are factual labels derived from raw facts. They are not a score.
 Current signals:
 
 - `public_signature_changed`;
+- `public_symbol_added`;
+- `public_symbol_deleted`;
+- `type_annotations_changed`;
 - `signature_changed_with_unchanged_callers`;
 - `complexity_increased`;
-- `logic_changed_without_test_movement`;
+- `implementation_changed_without_test_movement`;
 - `path_changed_only`.
 
 Symbol changes are ordered by these signal weights to make the output more
 review-oriented without introducing a numeric score.
+
+`complexity_increased` currently uses the same threshold as the concise report:
+at least one structural complexity metric must increase by 2 or more.
 
 ## Output
 
